@@ -1,48 +1,67 @@
 #target photoshop
 app.bringToFront();
 
-function replaceContents(absPath) {
-    var d = new ActionDescriptor();
-    d.putPath(charIDToTypeID("null"), new File(absPath));
-    d.putInteger(stringIDToTypeID("pageNumber"), 1);
-    executeAction(stringIDToTypeID("placedLayerReplaceContents"), d, DialogModes.NO);
+function px(u){ return u.as("px"); }
+
+function openCopy(file) {
+    var doc = app.open(file);
+    doc.selection.selectAll();
+    doc.selection.copy();
+    doc.close(SaveOptions.DONOTSAVECHANGES);
 }
 
-// --- Snap the replaced SO to the exact saved rectangle (no drift) ---
-function normalizeToTarget(lyr, target) {
-    var oldUnits = app.preferences.rulerUnits;
-    app.preferences.rulerUnits = Units.PIXELS;
-    app.activeDocument.activeLayer = lyr;
+function fitActiveLayerToCanvasTopLeft(doc) {
+    var lyr = doc.activeLayer;
 
-    // Measure current bounds
+    // measure layer bounds in px
     var b = lyr.bounds;
-    function px(u){ return u.as("px"); }
-    var l=px(b[0]), t=px(b[1]), r=px(b[2]), btm=px(b[3]);
-    var w = r - l, h = btm - t;
+    var l = px(b[0]), t = px(b[1]), r = px(b[2]), btm = px(b[3]);
+    var lw = r - l, lh = btm - t;
 
-    // Scale to match target exactly (allow non-uniform)
-    if (w > 0 && h > 0) {
-        var sx = (target.w / w) * 100;
-        var sy = (target.h / h) * 100;
-        // resize from top-left so we can pin the corner later
+    // measure canvas in px
+    var cw = doc.width.as("px");
+    var ch = doc.height.as("px");
+
+    // non-uniform scale to match canvas exactly, anchored at top-left
+    if (lw > 0 && lh > 0) {
+        var sx = (cw / lw) * 100;
+        var sy = (ch / lh) * 100;
         lyr.resize(sx, sy, AnchorPosition.TOPLEFT);
     }
 
-    // Move top-left corner to target top-left (no center rounding)
-    b = lyr.bounds;
-    l=px(b[0]); t=px(b[1]);
-    var dx = target.l - l;
-    var dy = target.t - t;
-    if (dx || dy) lyr.translate(dx, dy);  // fractional px allowed
+    // re-read and snap top-left to (0,0)
+    b = lyr.bounds; l = px(b[0]); t = px(b[1]);
+    if (l !== 0 || t !== 0) lyr.translate(-l, -t);
+}
 
-    app.preferences.rulerUnits = oldUnits;
+function editSOAndFillWithFile(soLayer, file) {
+    // select SO and open its PSB
+    app.activeDocument.activeLayer = soLayer;
+    soLayer.editContents();            // now we're inside the SO/PSB doc
+
+    var soDoc = app.activeDocument;
+    // remove existing content (keep at least one layer active)
+    while (soDoc.layers.length > 1) {
+        soDoc.layers[0].remove();
+    }
+    // clear the remaining layer contents
+    try { soDoc.activeLayer.remove(); } catch(e) {}
+
+    // paste the new design
+    openCopy(file);                    // copies from source and closes it
+    soDoc.paste();                     // pasted layer is now active
+
+    // scale to the SO canvas exactly and align top-left
+    fitActiveLayerToCanvasTopLeft(soDoc);
+
+    // save & close SO, applying change to the parent document
+    soDoc.close(SaveOptions.SAVECHANGES);
 }
 
 function getBoundsPx(lyr) {
     var b = lyr.bounds;
-    function px(u){ return u.as("px"); }
-    var l=px(b[0]), t=px(b[1]), r=px(b[2]), btm=px(b[3]);
-    return { l:l, t:t, r:r, b:btm, w:r-l, h:btm-t, cx:(l+r)/2, cy:(t+btm)/2 };
+    return { l:px(b[0]), t:px(b[1]), r:px(b[2]), b:px(b[3]),
+             w:px(b[2]) - px(b[0]), h:px(b[3]) - px(b[1]) };
 }
 
 function forEachImmediateLayer(layerSet, fn) {
@@ -59,74 +78,53 @@ function exportPNG(outFile) {
     app.activeDocument.exportDocument(outFile, ExportType.SAVEFORWEB, o);
 }
 
-// ---- Auto-trim copy into _auto_trimmed subfolder (non-destructive) ----
-function prepareTrimmedCopy(srcFile) {
-    var parentFolder = Folder(srcFile.path);
-    var trimmedFolder = Folder(parentFolder.fsName + "/_auto_trimmed");
-    if (!trimmedFolder.exists) trimmedFolder.create();
-
-    var trimmedFile = File(trimmedFolder.fsName + "/" + srcFile.name);
-
-    // Open, trim, save to _auto_trimmed
-    var doc = app.open(srcFile);
-    doc.trim(TrimType.TRANSPARENT, true, true, true, true);
-    doc.saveAs(trimmedFile, new PNGSaveOptions(), true);
-    doc.close(SaveOptions.DONOTSAVECHANGES);
-
-    return trimmedFile;
-}
-
 (function main(){
     if (!app.documents.length) { alert("Open your PSD first."); return; }
 
-    var inFolder = Folder.selectDialog("Select the folder of designs to place");
+    var inFolder = Folder.selectDialog("Select the folder of designs");
     if (!inFolder) { alert("No input folder selected."); return; }
     var files = inFolder.getFiles(/\.(png|jpg|jpeg|tif|tiff)$/i);
     if (!files.length) { alert("No images found."); return; }
 
-    var outFolder = Folder.selectDialog("Select the output folder for PNG exports");
+    var outFolder = Folder.selectDialog("Select the output folder for PNGs");
     if (!outFolder) { alert("No output folder selected."); return; }
 
-    // User must select the TEMPLATE group (with 2 Smart Objects)
+    // Select your TEMPLATE group (two Smart Object layers) before running
     var templateGroup = app.activeDocument.activeLayer;
     if (!templateGroup || templateGroup.typename !== "LayerSet") {
-        alert("Select your TEMPLATE group (the two Smart Object layers) and run again.");
+        alert("Select your TEMPLATE group and run again.");
         return;
     }
 
-    // Record original placement/size of the SO layers
-    var soLayers = [], targets = [];
+    // Collect the two SO layers in the group
+    var soLayers = [];
     forEachImmediateLayer(templateGroup, function(lyr){
         if (lyr.typename === "ArtLayer" && lyr.kind === LayerKind.SMARTOBJECT) {
             soLayers.push(lyr);
-            targets.push(getBoundsPx(lyr));
         }
     });
     if (soLayers.length < 2) {
-        alert("Template group must contain two Smart Object layers (Normal & Multiply).");
+        alert("Template group must contain the two Smart Object layers (Normal & Multiply).");
         return;
     }
 
-    // Loop through each file
+    // Process each design
+    var oldUnits = app.preferences.rulerUnits;
+    app.preferences.rulerUnits = Units.PIXELS;
+
     for (var i=0; i<files.length; i++) {
-        var f = files[i];
-        if (!(f instanceof File)) continue;
+        var f = files[i]; if (!(f instanceof File)) continue;
 
-        // Prepare trimmed copy safely (saved to _auto_trimmed/)
-        var trimmed = prepareTrimmedCopy(f);
-
-        // Replace & align on both layers
+        // Fill each SO with the design (no transform change in parent)
         for (var s=0; s<soLayers.length; s++) {
-            var lyr = soLayers[s];
-            app.activeDocument.activeLayer = lyr;
-            replaceContents(trimmed.fsName);
-            normalizeToTarget(lyr, targets[s]);
+            editSOAndFillWithFile(soLayers[s], f);
         }
 
-        // Export PNG
+        // Export the result
         var base = f.name.replace(/\.[^\.]+$/, "");
         exportPNG(File(outFolder.fsName + "/" + base + ".png"));
     }
 
-    alert("✅ Done! Trimmed copies saved to '_auto_trimmed' and perfectly aligned PNGs exported to:\n" + outFolder.fsName);
+    app.preferences.rulerUnits = oldUnits;
+    alert("✅ Done! No drift: designs are pasted into each Smart Object canvas exactly.");
 })();

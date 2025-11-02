@@ -12,16 +12,15 @@ function replaceContents(absPath) {
 function normalizeToTarget(lyr, target) {
     var oldUnits = app.preferences.rulerUnits;
     app.preferences.rulerUnits = Units.PIXELS;
-
     app.activeDocument.activeLayer = lyr;
 
-    // 1) measure current bounds
+    // Measure current bounds
     var b = lyr.bounds;
     function px(u){ return u.as("px"); }
     var l=px(b[0]), t=px(b[1]), r=px(b[2]), btm=px(b[3]);
     var w = r - l, h = btm - t;
 
-    // 2) scale to match target exactly (allow non-uniform)
+    // Scale to match target exactly (allow non-uniform)
     if (w > 0 && h > 0) {
         var sx = (target.w / w) * 100;
         var sy = (target.h / h) * 100;
@@ -29,8 +28,7 @@ function normalizeToTarget(lyr, target) {
         lyr.resize(sx, sy, AnchorPosition.TOPLEFT);
     }
 
-    // 3) move top-left corner to target top-left (no center rounding)
-    // re-read bounds after resize
+    // Move top-left corner to target top-left (no center rounding)
     b = lyr.bounds;
     l=px(b[0]); t=px(b[1]);
     var dx = target.l - l;
@@ -61,6 +59,23 @@ function exportPNG(outFile) {
     app.activeDocument.exportDocument(outFile, ExportType.SAVEFORWEB, o);
 }
 
+// ---- Auto-trim copy into _auto_trimmed subfolder (non-destructive) ----
+function prepareTrimmedCopy(srcFile) {
+    var parentFolder = Folder(srcFile.path);
+    var trimmedFolder = Folder(parentFolder.fsName + "/_auto_trimmed");
+    if (!trimmedFolder.exists) trimmedFolder.create();
+
+    var trimmedFile = File(trimmedFolder.fsName + "/" + srcFile.name);
+
+    // Open, trim, save to _auto_trimmed
+    var doc = app.open(srcFile);
+    doc.trim(TrimType.TRANSPARENT, true, true, true, true);
+    doc.saveAs(trimmedFile, new PNGSaveOptions(), true);
+    doc.close(SaveOptions.DONOTSAVECHANGES);
+
+    return trimmedFile;
+}
+
 (function main(){
     if (!app.documents.length) { alert("Open your PSD first."); return; }
 
@@ -69,46 +84,49 @@ function exportPNG(outFile) {
     var files = inFolder.getFiles(/\.(png|jpg|jpeg|tif|tiff)$/i);
     if (!files.length) { alert("No images found."); return; }
 
-    var outFolder = Folder.selectDialog("Select the output folder for PNGs");
+    var outFolder = Folder.selectDialog("Select the output folder for PNG exports");
     if (!outFolder) { alert("No output folder selected."); return; }
 
-    // User must select the TEMPLATE group first
+    // User must select the TEMPLATE group (with 2 Smart Objects)
     var templateGroup = app.activeDocument.activeLayer;
     if (!templateGroup || templateGroup.typename !== "LayerSet") {
-        alert("Select your TEMPLATE group (the one with the two Smart Object layers) and run again.");
+        alert("Select your TEMPLATE group (the two Smart Object layers) and run again.");
         return;
     }
 
-    // Record your Smart Object layers’ ideal positions and sizes once
+    // Record original placement/size of the SO layers
     var soLayers = [], targets = [];
     forEachImmediateLayer(templateGroup, function(lyr){
         if (lyr.typename === "ArtLayer" && lyr.kind === LayerKind.SMARTOBJECT) {
             soLayers.push(lyr);
-            targets.push(getBoundsPx(lyr)); // capture exact placement
+            targets.push(getBoundsPx(lyr));
         }
     });
     if (soLayers.length < 2) {
-        alert("Template group must contain the two Smart Object layers (Normal & Multiply).");
+        alert("Template group must contain two Smart Object layers (Normal & Multiply).");
         return;
     }
 
-    // Iterate over every design in the folder
+    // Loop through each file
     for (var i=0; i<files.length; i++) {
         var f = files[i];
         if (!(f instanceof File)) continue;
 
+        // Prepare trimmed copy safely (saved to _auto_trimmed/)
+        var trimmed = prepareTrimmedCopy(f);
+
+        // Replace & align on both layers
         for (var s=0; s<soLayers.length; s++) {
             var lyr = soLayers[s];
             app.activeDocument.activeLayer = lyr;
-
-            // Replace image + re-align precisely
-            replaceContents(f.fsName);
+            replaceContents(trimmed.fsName);
             normalizeToTarget(lyr, targets[s]);
         }
 
+        // Export PNG
         var base = f.name.replace(/\.[^\.]+$/, "");
         exportPNG(File(outFolder.fsName + "/" + base + ".png"));
     }
 
-    alert("✅ Done! Exported " + files.length + " perfectly aligned PNGs.");
+    alert("✅ Done! Trimmed copies saved to '_auto_trimmed' and perfectly aligned PNGs exported to:\n" + outFolder.fsName);
 })();
